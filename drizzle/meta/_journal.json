@@ -1,0 +1,20 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1788885441747,
+      "tag": "0000_lumpy_microchip",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1788885472048,
+      "tag": "0001_soft_metal_master",
+      "breakpoints": true
+    }
+  ]
+}
