@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "foodbridge-rescue",
-  "compatibility_date": "2026-09-12",
+  "compatibility_date": "2026-05-22",
   "compatibility_flags": ["nodejs_compat"],
   "main": "vinext/server/fetch-handler",
   "assets": {

@@ -107,6 +107,28 @@ curl -X POST http://localhost:8080/invocations \
   -d '{"prompt":"Coordinate 60 refrigerated meals in Salmiya before 9 PM."}'
 ```
 
+### Inspect tool calls with the AgentCore Inspector
+
+`agentcore dev` also launches the AWS AgentCore Inspector, a local debugging UI that shows every invocation, model turn, and tool call with full payloads. Start the project and open the Inspector URL the CLI prints:
+
+```bash
+cd FoodBridgeAgentCore
+agentcore dev
+```
+
+Then send a donation prompt from the Inspector (or the curl above) and watch the tool-call sequence it produces:
+
+1. `find_eligible_recipients` — receives `meals` and `refrigerated`; check the returned list only contains partners with enough capacity and, for chilled food, refrigerated storage.
+2. `request_human_approval` — the agent pauses here; confirm no `contact_recipient` call happens before this step.
+3. After you answer with an approval, the agent continues: `contact_recipient`, `assign_driver`, and `send_notification` fire, with the driver's vehicle matching the refrigeration requirement.
+4. Sending "The handoff is complete" then triggers `record_delivery`, creating the impact receipt.
+
+Things to verify in the Inspector while testing:
+
+- **Constraint enforcement:** change the prompt to an over-capacity request (e.g. 5,000 meals) and confirm no recipient is matched — the model cannot override the tool result.
+- **Human checkpoint:** the `contact_recipient` call must never appear before an approval turn.
+- **Provider routing:** responses report `model_provider` and `fallback_used`, so you can see Groq serve the request and the fallback chain engage if a provider is unavailable.
+
 ## Deploy the agent to AgentCore Runtime
 
 `FoodBridgeAgentCore/` is an AgentCore CLI project already configured as a Python, Strands, CodeZip runtime. From that directory:

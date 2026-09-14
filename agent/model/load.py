@@ -115,6 +115,8 @@ def is_provider_unavailable_error(error: BaseException) -> bool:
             "status code: 429",
             "status code: 401",
             "status code: 403",
+            "parsing failed",
+            "could not be parsed",
         )
     )
 

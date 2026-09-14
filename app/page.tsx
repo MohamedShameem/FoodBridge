@@ -2,6 +2,8 @@
 
 import Image from 'next/image';
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { DonationDraft, StructuredDonation } from '@/lib/structured-donation';
+import { speak, speechOutputSupported, speechRecognitionSupported, startDictation, stopSpeaking } from '@/lib/voice';
 
 type RuntimeMode = 'agentcore' | 'unavailable';
 type Donation = {
@@ -15,10 +17,12 @@ type Partner = { id: string; name: string; area: string; distanceKm: number; cap
 type Driver = { id: string; name: string; area: string; vehicle: string; status: string; completedTrips: number };
 type Metrics = { mealsRescued: number; completedRescues: number; activeRescues: number; totalRescues: number };
 type AppState = { donations: Donation[]; activities: Activity[]; partners: Partner[]; drivers: Driver[]; current: Donation | null; runtimeMode: RuntimeMode; metrics: Metrics };
-type AgentAction = { label: string; prompt: string; tone?: 'primary' | 'secondary' };
+type ChatWorkflowAction = 'sample' | 'createDonation' | 'approve' | 'reroute' | 'status' | 'complete' | 'openForm' | 'openRescue';
+type AgentAction = { label: string; prompt?: string; workflow?: ChatWorkflowAction; tone?: 'primary' | 'secondary' };
 type AgentMessage = { id: number; role: 'assistant' | 'user'; content: string; provider?: string; fallbackUsed?: boolean; runtimeMode?: RuntimeMode; latencyMs?: number; actions?: AgentAction[] };
 type WorkflowProgress = { title: string; detail: string; steps: string[]; active: number; elapsed: number };
 type SoundKind = 'approval' | 'success' | 'complete' | 'response';
+type DictationHandle = { stop: () => void; cancel: () => void };
 
 const emptyState: AppState = {
   donations: [], activities: [], partners: [], drivers: [], current: null, runtimeMode: 'unavailable',
@@ -35,7 +39,12 @@ const navItems = [
 const starterMessages: AgentMessage[] = [{
   id: 1,
   role: 'assistant',
-  content: 'Tell me what food is available, where it should be collected, and the pickup deadline. I’ll find the safest match and ask for your approval before anyone is contacted.',
+  content: '## Ready to coordinate a rescue\n\nTell me what food is available, or use the sample below to watch the complete workflow. I’ll always show a button when your approval is needed.',
+  actions: [
+    { label: 'Start sample rescue', workflow: 'sample', tone: 'primary' },
+    { label: 'Add my own donation', workflow: 'openForm' },
+    { label: 'How it works', prompt: 'Explain simply how FoodBridge coordinates a rescue and when you need my approval.' },
+  ],
 }];
 
 function statusLabel(status: string) {
@@ -63,6 +72,34 @@ function workflowFor(action: string): Omit<WorkflowProgress, 'active' | 'elapsed
   if (action === 'reroute') return { title: 'Finding another safe match', detail: 'FoodBridge is checking the next eligible partners.', steps: ['Reviewing the current match', 'Checking remaining capacity', 'Comparing safe alternatives', 'Preparing a new recommendation'] };
   if (action === 'complete') return { title: 'Recording the handoff', detail: 'FoodBridge is closing the rescue and updating its verified impact.', steps: ['Confirming the handoff', 'Saving the delivery time', 'Updating rescued meals', 'Creating the final receipt'] };
   return { title: 'Finding the best rescue match', detail: 'You can follow each check while FoodBridge prepares your approval.', steps: ['Reading the donation', 'Checking storage and capacity', 'Comparing nearby recipients', 'Preparing your approval card'] };
+}
+
+function actionsForRescue(donation: Donation | null): AgentAction[] {
+  if (donation?.status === 'approval_required') return [
+    { label: 'Approve this match', workflow: 'approve', tone: 'primary' },
+    { label: 'Show another recipient', workflow: 'reroute' },
+    { label: 'Open rescue details', workflow: 'openRescue' },
+  ];
+  if (donation?.status === 'scheduled') return [
+    { label: 'Show pickup status', workflow: 'status', tone: 'primary' },
+    { label: 'Confirm completed handoff', workflow: 'complete' },
+    { label: 'Open rescue details', workflow: 'openRescue' },
+  ];
+  return [
+    { label: 'Start sample rescue', workflow: 'sample', tone: 'primary' },
+    { label: 'Add my own donation', workflow: 'openForm' },
+    ...(donation ? [{ label: 'View latest receipt', workflow: 'openRescue' as const }] : []),
+  ];
+}
+
+function rescueChatSummary(state: AppState) {
+  const donation = state.current;
+  if (!donation) return '## Ready for a rescue\n\nAdd a donation or run the sample workflow.';
+  const recipient = state.partners.find((item) => item.id === donation.partnerId);
+  const volunteer = state.drivers.find((item) => item.id === donation.driverId);
+  if (donation.status === 'approval_required') return `## Match ready for approval\n\n**Status:** Paused for your decision\n\n**Best match:** ${recipient?.name ?? 'Qualified community partner'}\n\n**Why it fits:** Capacity, distance${donation.refrigerated ? ', refrigerated storage' : ''}, and reliability checks passed for all ${donation.meals} meals.\n\n**What happens next:** Press **Approve this match** below. FoodBridge will then arrange the volunteer and pickup plan.`;
+  if (donation.status === 'scheduled') return `## Pickup arranged\n\n**Recipient:** ${recipient?.name ?? 'Confirmed recipient'}\n\n**Volunteer:** ${volunteer?.name ?? 'Assigned volunteer'}${volunteer?.vehicle ? ` · ${volunteer.vehicle}` : ''}\n\n**Collect before:** ${donation.pickupBy}\n\nThe food source, recipient, and volunteer have a pickup plan. After the food changes hands, press **Confirm completed handoff**.`;
+  return `## Rescue completed\n\n**${donation.meals} meals delivered**\n\nThe handoff to ${recipient?.name ?? 'the recipient'} was confirmed on ${formatDate(donation.completedAt)}. The verified impact total and rescue history are updated.`;
 }
 
 function inlineText(text: string) {
@@ -140,8 +177,16 @@ export default function Home() {
   const [agentProgress, setAgentProgress] = useState({ steps: [] as string[], active: 0, elapsed: 0 });
   const [workflowProgress, setWorkflowProgress] = useState<WorkflowProgress | null>(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
+  const [voiceReplies, setVoiceReplies] = useState(false);
+  const [micSupported, setMicSupported] = useState(false);
+  const [voiceSupported, setVoiceSupported] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [structuredDonation, setStructuredDonation] = useState<StructuredDonation | null>(null);
+  const [donationDraft, setDonationDraft] = useState<DonationDraft | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const dictationRef = useRef<DictationHandle | null>(null);
   const audioRef = useRef<AudioContext | null>(null);
 
   const loadState = useCallback(async () => {
@@ -157,7 +202,16 @@ export default function Home() {
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }, [agentMessages, agentProgress.active, agentBusy]);
+  }, [agentMessages, agentProgress.active, agentBusy, structuredDonation]);
+
+  useEffect(() => {
+    setMicSupported(speechRecognitionSupported());
+    setVoiceSupported(speechOutputSupported());
+    return () => {
+      dictationRef.current?.cancel();
+      stopSpeaking();
+    };
+  }, []);
 
   const current = data.donations.find((item) => item.id === selectedId) ?? data.current;
   const partner = data.partners.find((item) => item.id === current?.partnerId) ?? null;
@@ -198,6 +252,11 @@ export default function Home() {
     if ('vibrate' in navigator) navigator.vibrate(kind === 'complete' ? [35, 45, 55] : 35);
   }, [prepareSound]);
 
+  const announce = useCallback((content: string, kind: SoundKind = 'response') => {
+    playCue(kind);
+    if (voiceReplies) speak(content);
+  }, [playCue, voiceReplies]);
+
   function toggleSound() {
     const next = !soundEnabled;
     setSoundEnabled(next);
@@ -206,6 +265,40 @@ export default function Home() {
       if (!audioRef.current) audioRef.current = new AudioContextClass();
       void audioRef.current.resume();
     }
+  }
+
+  function toggleVoiceReplies() {
+    const next = !voiceReplies;
+    setVoiceReplies(next);
+    if (!next) stopSpeaking();
+    else speak('Voice replies are on. Tell me about the food you want to rescue.');
+  }
+
+  function toggleDictation() {
+    if (listening) {
+      dictationRef.current?.stop();
+      return;
+    }
+    stopSpeaking();
+    setNotice('');
+    setListening(true);
+    const handle = startDictation({
+      onInterim: (text) => setAgentInput(text),
+      onFinal: (text) => {
+        setListening(false);
+        setAgentInput(text);
+        void sendAgentMessage(text);
+      },
+      onError: (message) => {
+        setListening(false);
+        setNotice(message);
+      },
+      onEnd: () => {
+        setListening(false);
+        dictationRef.current = null;
+      },
+    });
+    dictationRef.current = handle;
   }
 
   async function act(action: string, extra: Record<string, unknown> = {}) {
@@ -258,9 +351,104 @@ export default function Home() {
     });
   }
 
+  async function runChatWorkflow(workflow: ChatWorkflowAction, userText?: string, donationDetails?: StructuredDonation) {
+    if (agentBusy) return;
+    if (workflow === 'openForm') { setModalOpen(true); return; }
+    if (workflow === 'openRescue') { if (current) setSelectedId(current.id); setView('overview'); return; }
+
+    const label = userText || ({
+      sample: 'Start the sample rescue', approve: 'Approve this match', reroute: 'Show another recipient',
+      createDonation: 'Start this rescue', status: 'Show the pickup status', complete: 'Confirm the completed handoff',
+    } as Partial<Record<ChatWorkflowAction, string>>)[workflow] || 'Continue';
+    const userMessage: AgentMessage = { id: Date.now(), role: 'user', content: label };
+    setAgentMessages((items) => [...items, userMessage]);
+    setAgentInput('');
+    if (workflow === 'sample') { setStructuredDonation(null); setDonationDraft(null); }
+
+    if (workflow === 'sample' && data.current && data.current.status !== 'completed') {
+      const response = '## Rescue already in progress\n\nContinue the current rescue using the button below. FoodBridge will not create a duplicate.';
+      setAgentMessages((items) => [...items, { id: Date.now() + 1, role: 'assistant', content: response, actions: actionsForRescue(data.current) }]);
+      announce(response);
+      return;
+    }
+    if (workflow === 'status') {
+      const response = rescueChatSummary(data);
+      setAgentMessages((items) => [...items, { id: Date.now() + 1, role: 'assistant', content: response, actions: actionsForRescue(current) }]);
+      announce(response);
+      return;
+    }
+
+    const action = workflow === 'sample' || workflow === 'createDonation' ? 'create' : workflow;
+    const progress = workflowFor(action);
+    setAgentBusy(true);
+    setAgentProgress({ steps: progress.steps, active: 0, elapsed: 0 });
+    const timer = window.setInterval(() => setAgentProgress((value) => ({
+      ...value, elapsed: value.elapsed + 1, active: Math.min(Math.floor((value.elapsed + 1) / 2), value.steps.length - 1),
+    })), 1000);
+    try {
+      const payload = workflow === 'sample'
+        ? { action: 'create', donor: 'FoodBridge Demo Kitchen', area: 'Salmiya', foodType: '24 sealed chilled meals', meals: 24, pickupBy: '20:30', refrigerated: true }
+        : workflow === 'createDonation' && donationDetails
+          ? { action: 'create', ...donationDetails }
+          : { action, id: current?.id };
+      const response = await fetch('/api/rescues', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      });
+      const next = await response.json() as AppState & { error?: string };
+      if (!response.ok) throw new Error(next.error || 'FoodBridge could not complete that step.');
+      setData(next);
+      setSelectedId(next.current?.id ?? null);
+      if (workflow === 'createDonation') { setStructuredDonation(null); setDonationDraft(null); }
+      setAgentMessages((items) => [...items, {
+        id: Date.now() + 1, role: 'assistant', content: rescueChatSummary(next),
+        provider: next.current?.modelProvider ?? undefined, actions: actionsForRescue(next.current),
+      }]);
+      announce(rescueChatSummary(next), workflow === 'complete' ? 'complete' : workflow === 'approve' ? 'success' : 'approval');
+    } catch (error) {
+      setAgentMessages((items) => [...items, {
+        id: Date.now() + 1, role: 'assistant',
+        content: `## I couldn't complete that step\n\n${error instanceof Error ? error.message : 'Please try again.'}`,
+        actions: actionsForRescue(current),
+      }]);
+    } finally {
+      window.clearInterval(timer);
+      setAgentProgress({ steps: [], active: 0, elapsed: 0 });
+      setAgentBusy(false);
+    }
+  }
+
+  function handleAgentAction(action: AgentAction) {
+    const inferred = action.workflow
+      ?? (action.label.toLowerCase().includes('approve') ? 'approve'
+        : action.label.toLowerCase().includes('other recipient') ? 'reroute'
+          : action.label.toLowerCase().includes('confirm handoff') ? 'complete'
+            : action.label.toLowerCase().includes('rescue status') ? 'status' : undefined);
+    if (inferred) return runChatWorkflow(inferred);
+    return sendAgentMessage(action.prompt ?? action.label);
+  }
+
+  function reviseDonationDetails() {
+    if (!structuredDonation) return;
+    setAgentInput(`Change these donation details: ${structuredDonation.meals} meals of ${structuredDonation.foodType} in ${structuredDonation.area}, collect before ${structuredDonation.pickupBy}. `);
+    window.setTimeout(() => composerRef.current?.focus(), 0);
+  }
+
   async function sendAgentMessage(message = agentInput) {
     const clean = message.trim();
     if (!clean || agentBusy) return;
+    const command = clean.toLowerCase();
+    if (/^(stop|stop speaking|be quiet|mute voice)[.! ]*$/.test(command)) {
+      stopSpeaking();
+      setVoiceReplies(false);
+      setAgentInput('');
+      return;
+    }
+    if (structuredDonation && /^(start|start rescue|start this rescue|confirm|looks good|yes)[.! ]*$/.test(command)) return runChatWorkflow('createDonation', clean, structuredDonation);
+    if (current?.status === 'approval_required' && /^(ok|okay|yes|approved|approve|go ahead|proceed)[.! ]*$/.test(command)) return runChatWorkflow('approve', clean);
+    if (current?.status === 'scheduled' && /^(done|complete|completed|handoff complete|confirm)[.! ]*$/.test(command)) return runChatWorkflow('complete', clean);
+    if (current && /^(status|show status|pickup status|where is the rescue)[.!? ]*$/.test(command)) return runChatWorkflow('status', clean);
+    if (current?.status === 'approval_required' && /^(alternative|another recipient|show another|reroute|different recipient)[.! ]*$/.test(command)) return runChatWorkflow('reroute', clean);
+    if (/^(try|start|run).*(sample|demo).*(donation|rescue)/.test(command)) return runChatWorkflow('sample', clean);
     prepareSound();
     const userMessage: AgentMessage = { id: Date.now(), role: 'user', content: clean };
     const prior = agentMessages;
@@ -274,12 +462,14 @@ export default function Home() {
     try {
       const response = await fetch('/api/agent', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: clean, history: prior.map(({ role, content }) => ({ role, content })) }),
+        body: JSON.stringify({ message: clean, history: prior.map(({ role, content }) => ({ role, content })), draft: donationDraft }),
       });
-      const result = await response.json() as { result?: string; error?: string; modelProvider?: string; fallbackUsed?: boolean; runtimeMode?: RuntimeMode; latencyMs?: number; suggestedActions?: AgentAction[] };
+      const result = await response.json() as { result?: string; error?: string; modelProvider?: string; fallbackUsed?: boolean; runtimeMode?: RuntimeMode; latencyMs?: number; suggestedActions?: AgentAction[]; structuredDonation?: StructuredDonation | null; donationDraft?: DonationDraft | null };
       if (!response.ok || !result.result) throw new Error(result.error || 'The live agent did not return a response.');
+      setStructuredDonation(result.structuredDonation ?? null);
+      setDonationDraft(result.donationDraft ?? null);
       setAgentMessages((items) => [...items, { id: Date.now() + 1, role: 'assistant', content: result.result!, provider: result.modelProvider, fallbackUsed: result.fallbackUsed, runtimeMode: result.runtimeMode, latencyMs: result.latencyMs, actions: result.suggestedActions }]);
-      playCue('response');
+      announce(result.result);
     } catch (error) {
       setAgentMessages((items) => [...items, { id: Date.now() + 1, role: 'assistant', content: error instanceof Error ? error.message : 'The live agent is unavailable.' }]);
     } finally {
@@ -350,8 +540,61 @@ export default function Home() {
         </>}
 
         {view === 'agent' && <section className="agent-workspace">
-          <div className="agent-workspace-intro"><p className="eyebrow">Your rescue coordinator</p><h2>Ask. Then watch FoodBridge move.</h2><p>Describe available food or ask about a rescue. FoodBridge checks the important details, explains the best next step, and keeps you in control.</p><div className="agent-capabilities"><span>Find a recipient</span><span>Check safe storage</span><span>Arrange a volunteer</span><span>Wait for approval</span></div><div className={`runtime-proof ${live ? '' : 'offline'}`}><div><i /><span><strong>{live ? 'FoodBridge is ready' : 'Service unavailable'}</strong><small>{live ? 'Live rescue help is connected' : 'Please try again shortly'}</small></span></div><span>{live ? 'Ready' : 'Offline'}</span></div></div>
-          <article className="chat-panel"><header className="chat-head"><span className="agent-orb" /><div><strong>FoodBridge Coordinator</strong><p>Food rescue assistant</p></div><span className={`running ${live ? '' : 'offline'}`}>{live ? 'Ready' : 'Offline'}</span></header><div className="chat-messages" aria-live="polite">{agentMessages.map((message, index) => <div className={`chat-turn ${message.role}`} key={message.id}><div className={`chat-message ${message.role}`}><span className="chat-speaker">{message.role === 'assistant' ? 'F' : 'You'}</span><div>{message.role === 'assistant' ? <FormattedAgentResponse content={message.content} /> : <p>{message.content}</p>}{message.role === 'assistant' && message.provider && <small><i /> Live answer{message.fallbackUsed ? ' · backup connection used' : ''}{message.latencyMs ? ` · ${(message.latencyMs / 1000).toFixed(1)}s` : ''}</small>}</div></div>{message.role === 'assistant' && index === agentMessages.length - 1 && message.actions && <div className="response-actions">{message.actions.map((action) => <button key={action.label} className={action.tone === 'primary' ? 'primary-action' : ''} onClick={() => void sendAgentMessage(action.prompt)} disabled={agentBusy}>{action.label}<span>→</span></button>)}</div>}</div>)}{agentBusy && <div className="agent-progress" role="status"><div className="progress-head"><span className="progress-orb"><i /><i /><i /></span><div><strong>FoodBridge is checking</strong><small>Follow the live progress</small></div><time>{agentProgress.elapsed}s</time></div><div className="progress-steps">{agentProgress.steps.map((step, index) => <div className={`${index < agentProgress.active ? 'done' : index === agentProgress.active ? 'active' : 'pending'}`} key={step}><span>{index < agentProgress.active ? '✓' : index + 1}</span><p>{step}</p>{index === agentProgress.active && <i />}</div>)}</div></div>}<div ref={chatEndRef} /></div><div className="prompt-chips"><button onClick={() => void sendAgentMessage('Explain simply how FoodBridge coordinates a rescue and when you need my approval.')}>How does FoodBridge work?</button><button onClick={() => void sendAgentMessage('Coordinate 24 refrigerated meals in Salmiya before 8:30 PM.')}>Try a sample donation</button></div><form className="chat-composer" onSubmit={(event) => { event.preventDefault(); void sendAgentMessage(); }}><label htmlFor="agent-message">Ask FoodBridge</label><div><textarea id="agent-message" value={agentInput} onChange={(event) => setAgentInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendAgentMessage(); } }} placeholder="We have 45 chilled meals in Hawally…" rows={2} maxLength={2000} /><button type="submit" disabled={agentBusy || !agentInput.trim() || !live} aria-label="Send message">→</button></div><small>FoodBridge will always ask before contacting a recipient or volunteer.</small></form></article>
+          <article className="chat-panel">
+            <header className="chat-head">
+              <span className="agent-orb" />
+              <div><strong>FoodBridge Rescue Coordinator</strong><p>Speak or type — I’ll ask for one detail at a time</p></div>
+              {voiceSupported && <button className={`voice-reply-toggle ${voiceReplies ? 'on' : ''}`} onClick={toggleVoiceReplies} aria-pressed={voiceReplies} aria-label={voiceReplies ? 'Turn spoken replies off' : 'Turn spoken replies on'}><span>{voiceReplies ? '◖))' : '◖)'}</span>{voiceReplies ? 'Voice on' : 'Voice off'}</button>}
+              <span className={`running ${live ? '' : 'offline'}`}>{live ? 'Ready' : 'Offline'}</span>
+            </header>
+            <div className="chat-messages" aria-live="polite">
+              {agentMessages.map((message, index) => <div className={`chat-turn ${message.role}`} key={message.id}>
+                <div className={`chat-message ${message.role}`}>
+                  <span className="chat-speaker">{message.role === 'assistant' ? 'F' : 'You'}</span>
+                  <div>
+                    {message.role === 'assistant' ? <FormattedAgentResponse content={message.content} /> : <p>{message.content}</p>}
+                    {message.role === 'assistant' && message.provider && <small><i /> Rescue updated{message.fallbackUsed ? ' · backup connection used' : ''}{message.latencyMs ? ` · ${(message.latencyMs / 1000).toFixed(1)}s` : ''}</small>}
+                  </div>
+                </div>
+                {message.role === 'assistant' && index === agentMessages.length - 1 && message.actions && message.actions.length > 0 && <div className="response-actions">{message.actions.map((action) => <button key={action.label} className={action.tone === 'primary' ? 'primary-action' : ''} onClick={() => void handleAgentAction(action)} disabled={agentBusy}>{action.label}<span>→</span></button>)}</div>}
+              </div>)}
+              {structuredDonation && !agentBusy && <section className="voice-donation-card" aria-label="Donation ready to review">
+                <div className="voice-card-head"><span>✓</span><div><p>Ready for your review</p><strong>Start only when these details are correct</strong></div></div>
+                <div className="voice-donation-grid">
+                  <div><small>Food</small><strong>{structuredDonation.foodType}</strong></div>
+                  <div><small>Quantity</small><strong>{structuredDonation.meals} meals</strong></div>
+                  <div><small>Pickup area</small><strong>{structuredDonation.area}</strong></div>
+                  <div><small>Collect before</small><strong>{structuredDonation.pickupBy}</strong></div>
+                  <div><small>Food source</small><strong>{structuredDonation.donor}</strong></div>
+                  <div><small>Storage</small><strong>{structuredDonation.refrigerated ? 'Keep refrigerated' : 'Room temperature'}</strong></div>
+                </div>
+                <p className="voice-card-note">FoodBridge will check capacity, safe storage, distance, and timing. No recipient is contacted until you approve the match.</p>
+                <div className="voice-card-actions">
+                  <button className="approve-button" onClick={() => void runChatWorkflow('createDonation', 'Start this rescue', structuredDonation)}>Start this rescue →</button>
+                  <button className="secondary-button" onClick={reviseDonationDetails}>Change details</button>
+                  <button className="text-button" onClick={() => { setStructuredDonation(null); setDonationDraft(null); }}>Cancel</button>
+                </div>
+              </section>}
+              {agentBusy && <div className="agent-progress" role="status">
+                <div className="progress-head"><span className="progress-orb"><i /><i /><i /></span><div><strong>FoodBridge is working</strong><small>{agentProgress.steps[agentProgress.active] ?? 'Preparing the next step'}</small></div><time>{agentProgress.elapsed}s</time></div>
+                <div className="progress-steps">{agentProgress.steps.map((step, index) => <div className={`${index < agentProgress.active ? 'done' : index === agentProgress.active ? 'active' : 'pending'}`} key={step}><span>{index < agentProgress.active ? '✓' : index + 1}</span><p>{step}</p>{index === agentProgress.active && <i />}</div>)}</div>
+              </div>}
+              <div ref={chatEndRef} />
+            </div>
+            <div className="prompt-chips">
+              {actionsForRescue(current).slice(0, 3).map((action) => <button key={action.label} onClick={() => void handleAgentAction(action)} disabled={agentBusy}>{action.label}</button>)}
+              <button onClick={() => void sendAgentMessage('Explain simply how FoodBridge coordinates a rescue and when you need my approval.')} disabled={agentBusy}>How does FoodBridge work?</button>
+            </div>
+            <form className={`chat-composer ${listening ? 'listening' : ''}`} onSubmit={(event) => { event.preventDefault(); void sendAgentMessage(); }}>
+              <label htmlFor="agent-message">{listening ? 'Listening — speak naturally' : 'Ask FoodBridge'}</label>
+              <div>
+                <textarea ref={composerRef} id="agent-message" value={agentInput} onChange={(event) => setAgentInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendAgentMessage(); } }} placeholder={micSupported ? 'Type a message or tap the microphone…' : 'Describe the food you want to rescue…'} rows={2} maxLength={2000} />
+                {micSupported && <button type="button" className={`mic-button ${listening ? 'active' : ''}`} onClick={toggleDictation} disabled={agentBusy || !live} aria-pressed={listening} aria-label={listening ? 'Stop listening' : 'Speak to FoodBridge'}><span>{listening ? '■' : '●'}</span></button>}
+                <button type="submit" disabled={agentBusy || !agentInput.trim() || !live} aria-label="Send message">→</button>
+              </div>
+              <small>{listening ? 'Your words will be sent when you finish speaking.' : 'FoodBridge asks for missing details, then shows a review card before starting.'}</small>
+            </form>
+          </article>
         </section>}
 
         {view === 'rescues' && <section className="data-section"><div className="data-heading"><p className="eyebrow">Rescue record</p><h2>Every rescue, exactly as it happened.</h2><p>See active pickups, completed handoffs, and the exact number of meals delivered.</p></div><HistoryGroup title={`Active · ${active.length}`} items={active} partners={data.partners} onSelect={(id) => { setSelectedId(id); setView('overview'); }} /><HistoryGroup title={`Completed · ${completed.length}`} items={completed} partners={data.partners} onSelect={(id) => { setSelectedId(id); setView('overview'); }} emptyText="Completed handoffs will appear here with their confirmed time and meal count." /></section>}
