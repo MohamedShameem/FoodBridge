@@ -1,1 +1,8 @@
-[]
+[
+  {
+    "name": "default",
+    "description": "FoodBridge hackathon deployment",
+    "account": "810477631537",
+    "region": "us-west-2"
+  }
+]

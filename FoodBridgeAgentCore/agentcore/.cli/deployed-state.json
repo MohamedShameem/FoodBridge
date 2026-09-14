@@ -1,3 +1,26 @@
 {
-  "targets": {}
+  "targets": {
+    "default": {
+      "resources": {
+        "runtimes": {
+          "FoodBridgeAgent": {
+            "runtimeId": "FoodBridgeAgentCore_FoodBridgeAgent-lKOMWyF0Bd",
+            "runtimeArn": "arn:aws:bedrock-agentcore:us-west-2:810477631537:runtime/FoodBridgeAgentCore_FoodBridgeAgent-lKOMWyF0Bd",
+            "roleArn": "arn:aws:iam::810477631537:role/AgentCore-FoodBridgeAgent-ApplicationAgentFoodBridg-0Lb80ASQSl9H"
+          }
+        },
+        "credentials": {
+          "foodbridge-glm": {
+            "credentialProviderArn": "arn:aws:bedrock-agentcore:us-west-2:810477631537:token-vault/default/apikeycredentialprovider/foodbridge-glm"
+          },
+          "foodbridge-groq": {
+            "credentialProviderArn": "arn:aws:bedrock-agentcore:us-west-2:810477631537:token-vault/default/apikeycredentialprovider/foodbridge-groq"
+          }
+        },
+        "stackName": "AgentCore-FoodBridgeAgentCore-default",
+        "identityKmsKeyArn": "arn:aws:kms:us-west-2:810477631537:key/ea412662-4e3c-4517-9316-7c0d535ebb20",
+        "deployHash": "219000aa2625c238"
+      }
+    }
+  }
 }

@@ -1,3 +1,5 @@
+"""Load FoodBridge's Groq, GLM, and final-fallback Bedrock models."""
+
 import os
 
 from botocore.config import Config
@@ -78,7 +80,7 @@ def load_model(provider: str = BEDROCK_PROVIDER, *, api_key: str | None = None):
             },
             model_id=os.getenv("GLM_MODEL_ID", "glm-5.1"),
         )
-    raise ValueError(f"Unsupported model provider: {provider}")
+    raise ValueError(f"Unsupported MODEL_PROVIDER: {provider}")
 
 
 def is_provider_unavailable_error(error: BaseException) -> bool:

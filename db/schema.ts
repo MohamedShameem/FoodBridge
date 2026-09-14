@@ -16,7 +16,8 @@ export const donations = sqliteTable('donations', {
   foodType: text('food_type').notNull(), meals: integer('meals').notNull(), pickupBy: text('pickup_by').notNull(),
   refrigerated: integer('refrigerated', { mode: 'boolean' }).notNull(), status: text('status').notNull(),
   partnerId: text('partner_id').references(() => partners.id), driverId: text('driver_id').references(() => drivers.id),
-  createdAt: text('created_at').notNull(),
+  agentSummary: text('agent_summary'), modelProvider: text('model_provider'), runtimeMode: text('runtime_mode'),
+  createdAt: text('created_at').notNull(), completedAt: text('completed_at'),
 }, (table) => [index('idx_donations_status_created').on(table.status, table.createdAt)]);
 
 export const activities = sqliteTable('activities', {

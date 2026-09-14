@@ -15,6 +15,13 @@
       "when": 1788885472048,
       "tag": "0001_soft_metal_master",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1789339250679,
+      "tag": "0002_fine_white_queen",
+      "breakpoints": true
     }
   ]
 }

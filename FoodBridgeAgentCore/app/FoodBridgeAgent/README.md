@@ -24,6 +24,15 @@ invoking the agent.
 | Variable | Required | Description |
 | --- | --- | --- |
 | `LOCAL_DEV` | No | Set to `1` to use `.env.local` instead of AgentCore Identity |
+| `GROQ_API_KEY` | Local only | Fast-path Groq credential; never commit it |
+| `GROQ_MODEL_ID` | No | Groq model; defaults to `openai/gpt-oss-20b` |
+| `GROQ_BASE_URL` | No | Groq OpenAI-compatible API base URL |
+| `GROQ_CREDENTIAL_PROVIDER_NAME` | AgentCore primary | AgentCore Identity provider containing the Groq key |
+| `GLM_API_KEY` | Local only | Secondary GLM credential; never commit it |
+| `GLM_MODEL_ID` | No | GLM model; defaults to `glm-5.1` |
+| `GLM_BASE_URL` | No | Z.AI OpenAI-compatible API base URL |
+| `GLM_CREDENTIAL_PROVIDER_NAME` | AgentCore fallback | AgentCore Identity provider containing the GLM key |
+| `BEDROCK_MODEL_ID` | No | Final AWS fallback; defaults to `us.amazon.nova-micro-v1:0` |
 
 # Developing locally
 
@@ -43,3 +52,5 @@ In a new terminal, you can invoke that server with:
 After providing credentials, `agentcore deploy` will deploy your project into Amazon Bedrock AgentCore.
 
 Use `agentcore invoke` to invoke your deployed agent.
+
+The runtime routes Groq first, GLM second, and Amazon Nova Micro last. Store the external-provider keys in AgentCore Identity as `foodbridge-groq` and `foodbridge-glm`; never put them in `agentcore.json`.

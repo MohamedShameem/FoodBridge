@@ -14,13 +14,52 @@
       "entrypoint": "main.py",
       "codeLocation": "app/FoodBridgeAgent/",
       "runtimeVersion": "PYTHON_3_14",
+      "envVars": [
+        {
+          "name": "GROQ_MODEL_ID",
+          "value": "openai/gpt-oss-20b"
+        },
+        {
+          "name": "GROQ_BASE_URL",
+          "value": "https://api.groq.com/openai/v1"
+        },
+        {
+          "name": "GROQ_CREDENTIAL_PROVIDER_NAME",
+          "value": "foodbridge-groq"
+        },
+        {
+          "name": "BEDROCK_MODEL_ID",
+          "value": "us.amazon.nova-micro-v1:0"
+        },
+        {
+          "name": "GLM_MODEL_ID",
+          "value": "glm-5.1"
+        },
+        {
+          "name": "GLM_BASE_URL",
+          "value": "https://api.z.ai/api/paas/v4/"
+        },
+        {
+          "name": "GLM_CREDENTIAL_PROVIDER_NAME",
+          "value": "foodbridge-glm"
+        }
+      ],
       "networkMode": "PUBLIC",
       "protocol": "HTTP"
     }
   ],
   "memories": [],
   "knowledgeBases": [],
-  "credentials": [],
+  "credentials": [
+    {
+      "authorizerType": "ApiKeyCredentialProvider",
+      "name": "foodbridge-glm"
+    },
+    {
+      "authorizerType": "ApiKeyCredentialProvider",
+      "name": "foodbridge-groq"
+    }
+  ],
   "evaluators": [],
   "onlineEvalConfigs": [],
   "agentCoreGateways": [],

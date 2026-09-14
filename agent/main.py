@@ -1,16 +1,27 @@
 """FoodBridge Strands agent, ready for Amazon Bedrock AgentCore Runtime."""
 
 import json
+import logging
 import os
 from datetime import UTC, datetime
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from bedrock_agentcore.identity.auth import requires_api_key
 from strands import Agent, tool
-from strands.models import BedrockModel
 
 from foodbridge.domain import rank_recipients
+from model.load import (
+    BEDROCK_PROVIDER,
+    GLM_PROVIDER,
+    GROQ_PROVIDER,
+    glm_is_configured,
+    groq_is_configured,
+    is_provider_unavailable_error,
+    load_model,
+)
 
 app = BedrockAgentCoreApp()
+logger = logging.getLogger(__name__)
 
 
 @tool
@@ -62,26 +73,118 @@ Rules:
 6. If a recipient is unavailable, continue to the next eligible candidate instead of stopping.
 7. Do not invent a completed delivery; only call record_delivery after the operator confirms the handoff.
 8. Keep responses concise and include the current workflow status.
+9. Write for busy restaurant, charity, and volunteer coordinators. Use plain language and short, scannable sections.
+10. Never expose model providers, infrastructure, SDK names, internal tool names, JSON, or code in a user-facing answer.
+11. For a donation response, clearly show Status, Best match, Why it fits, and What happens next. Stay under 180 words unless asked for more detail.
 """
 
-model = BedrockModel(model_id=os.getenv("BEDROCK_MODEL_ID", "us.amazon.nova-micro-v1:0"))
-agent = Agent(
-    model=model,
-    system_prompt=SYSTEM_PROMPT,
-    tools=[find_eligible_recipients, request_human_approval, contact_recipient, assign_driver, send_notification, record_delivery],
+TOOLS = [find_eligible_recipients, request_human_approval, contact_recipient, assign_driver, send_notification, record_delivery]
+
+
+def build_agent(provider: str, *, api_key: str | None = None) -> Agent:
+    """Build the same FoodBridge agent against the selected model provider."""
+    return Agent(
+        model=load_model(provider, api_key=api_key),
+        system_prompt=SYSTEM_PROMPT,
+        tools=TOOLS,
+        # Provider routing is handled explicitly by run_agent.
+        retry_strategy=None,
+    )
+
+
+PROVIDER_ORDER = (GROQ_PROVIDER, GLM_PROVIDER, BEDROCK_PROVIDER)
+
+
+@requires_api_key(
+    provider_name=os.getenv("GROQ_CREDENTIAL_PROVIDER_NAME", "foodbridge-groq")
 )
+async def build_identity_groq_agent(*, api_key: str) -> Agent:
+    """Retrieve Groq's key from AgentCore Identity and create a fresh session."""
+    return build_agent(GROQ_PROVIDER, api_key=api_key)
+
+
+@requires_api_key(
+    provider_name=os.getenv("GLM_CREDENTIAL_PROVIDER_NAME", "foodbridge-glm")
+)
+async def build_identity_glm_agent(*, api_key: str) -> Agent:
+    """Retrieve GLM's key from AgentCore Identity and create a fresh session."""
+    return build_agent(GLM_PROVIDER, api_key=api_key)
+
+
+async def resolve_agent(provider: str) -> Agent | None:
+    """Create an isolated Strands session using local or AgentCore credentials."""
+    if provider == GROQ_PROVIDER:
+        if groq_is_configured():
+            return build_agent(provider)
+        if os.getenv("GROQ_CREDENTIAL_PROVIDER_NAME"):
+            return await build_identity_groq_agent()
+        return None
+    if provider == GLM_PROVIDER:
+        if glm_is_configured():
+            return build_agent(provider)
+        if os.getenv("GLM_CREDENTIAL_PROVIDER_NAME"):
+            return await build_identity_glm_agent()
+        return None
+    return build_agent(BEDROCK_PROVIDER)
+
+
+async def run_agent(prompt: str):
+    """Route Groq first, then GLM, keeping Amazon Bedrock as the final fallback."""
+    last_error: Exception | None = None
+    for provider in PROVIDER_ORDER:
+        try:
+            candidate = await resolve_agent(provider)
+        except Exception as error:
+            last_error = error
+            logger.warning("%s credential unavailable; trying the next provider", provider)
+            continue
+        if candidate is None:
+            continue
+        try:
+            response = await candidate.invoke_async(prompt)
+            return response, provider, provider != GROQ_PROVIDER
+        except Exception as error:
+            last_error = error
+            if provider == BEDROCK_PROVIDER or not is_provider_unavailable_error(error):
+                raise
+            logger.warning("%s unavailable; trying the next configured provider", provider)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("No model provider is configured.")
+
+
+def extract_response_text(response) -> str:
+    """Extract user-visible text while ignoring provider-specific reasoning blocks."""
+    message = getattr(response, "message", None)
+    if not isinstance(message, dict):
+        raise RuntimeError("Model response did not contain a message.")
+    content = message.get("content")
+    if not isinstance(content, list):
+        raise RuntimeError("Model response did not contain content blocks.")
+    text = "".join(
+        block["text"]
+        for block in content
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ).strip()
+    if not text:
+        raise RuntimeError("Model response did not contain text.")
+    return text
 
 
 @app.entrypoint
-def invoke(payload: dict):
+async def invoke(payload: dict):
     """AgentCore invocation contract: accept either a prompt or structured donation data."""
     prompt = payload.get("prompt")
     if not prompt:
         prompt = "Coordinate this donation: " + json.dumps(payload, default=str)
     if not isinstance(prompt, str) or not prompt.strip():
         return {"error": "Provide a non-empty prompt or structured donation payload."}
-    response = agent(prompt)
-    return {"result": response.message["content"][0]["text"]}
+    response, provider, fallback_used = await run_agent(prompt)
+    return {
+        "result": extract_response_text(response),
+        "model_provider": provider,
+        "fallback_used": fallback_used,
+    }
 
 
 if __name__ == "__main__":

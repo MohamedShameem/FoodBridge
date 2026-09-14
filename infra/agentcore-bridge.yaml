@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Secure HTTP bridge from the FoodBridge Cloudflare Worker to AgentCore Runtime.
+
+Parameters:
+  RuntimeArn:
+    Type: String
+    Description: ARN of the deployed FoodBridge AgentCore Runtime.
+  BridgeSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+
+Resources:
+  BridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AgentCore-FoodBridgeAgentBridgeRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeFoodBridgeAgentCore
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Ref RuntimeArn
+                  - !Sub '${RuntimeArn}/runtime-endpoint/*'
+
+  BridgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FoodBridgeAgentCoreBridge
+      Description: Authenticated public-site bridge to the FoodBridge Strands runtime.
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt BridgeRole.Arn
+      Timeout: 90
+      MemorySize: 256
+      Environment:
+        Variables:
+          FOODBRIDGE_RUNTIME_ARN: !Ref RuntimeArn
+          FOODBRIDGE_BRIDGE_SECRET: !Ref BridgeSecret
+      Code:
+        ZipFile: |
+          import base64
+          import boto3
+          import hmac
+          import json
+          import os
+          import uuid
+
+          runtime = boto3.client("bedrock-agentcore")
+          runtime_arn = os.environ["FOODBRIDGE_RUNTIME_ARN"]
+          bridge_secret = os.environ["FOODBRIDGE_BRIDGE_SECRET"]
+
+          def reply(status, body):
+              return {
+                  "statusCode": status,
+                  "headers": {"content-type": "application/json", "cache-control": "no-store"},
+                  "body": json.dumps(body) if isinstance(body, dict) else body,
+              }
+
+          def handler(event, context):
+              headers = {str(k).lower(): str(v) for k, v in (event.get("headers") or {}).items()}
+              supplied = headers.get("x-foodbridge-key", "")
+              if not supplied or not hmac.compare_digest(supplied, bridge_secret):
+                  return reply(401, {"error": "Unauthorized"})
+
+              try:
+                  raw_body = event.get("body") or "{}"
+                  if event.get("isBase64Encoded"):
+                      raw_body = base64.b64decode(raw_body).decode("utf-8")
+                  payload = json.loads(raw_body)
+                  if not isinstance(payload, dict):
+                      return reply(400, {"error": "Expected a JSON object."})
+
+                  result = runtime.invoke_agent_runtime(
+                      agentRuntimeArn=runtime_arn,
+                      qualifier="DEFAULT",
+                      runtimeSessionId=str(uuid.uuid4()),
+                      payload=json.dumps(payload).encode("utf-8"),
+                      contentType="application/json",
+                      accept="application/json",
+                  )
+                  stream = result.get("response")
+                  if hasattr(stream, "read"):
+                      response_body = stream.read()
+                  else:
+                      response_body = b"".join(stream or [])
+                  if isinstance(response_body, bytes):
+                      response_body = response_body.decode("utf-8")
+                  return reply(200, response_body or "{}")
+              except Exception as error:
+                  print(f"AgentCore bridge error: {type(error).__name__}: {error}")
+                  return reply(502, {"error": "AgentCore invocation failed."})
+
+  BridgeFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt BridgeFunction.Arn
+      AuthType: NONE
+      InvokeMode: BUFFERED
+      Cors:
+        AllowOrigins:
+          - https://foodbridge.byshameem.space
+        AllowMethods:
+          - POST
+        AllowHeaders:
+          - content-type
+          - x-foodbridge-key
+        MaxAge: 3600
+
+  BridgeUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !Ref BridgeFunction
+      FunctionUrlAuthType: NONE
+      Principal: '*'
+
+  BridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref BridgeFunction
+      InvokedViaFunctionUrl: true
+      Principal: '*'
+
+Outputs:
+  FunctionUrl:
+    Description: Server-side AgentCore bridge URL.
+    Value: !GetAtt BridgeFunctionUrl.FunctionUrl

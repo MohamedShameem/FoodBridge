@@ -1,6 +1,6 @@
 # FoodBridge AgentCore service
 
-This package is the required Strands Agents implementation. It contains the model configuration, safety rules, tools, and AgentCore Runtime entry point. The web dashboard can run independently in transparent demo mode while AWS credentials are being configured.
+This package is the required Strands Agents implementation. It contains the model configuration, safety rules, tools, and AgentCore Runtime entry point. Groq GPT-OSS 20B is the fast path, GLM is the secondary route, and Amazon Nova Micro is retained as the final AWS fallback. The web dashboard can run independently in transparent demo mode while credentials are being configured.
 
 ## Local setup
 
@@ -8,6 +8,8 @@ This package is the required Strands Agents implementation. It contains the mode
 uv sync
 uv run python main.py
 ```
+
+Copy the values from `.env.example` into an untracked local environment. Keep all API keys untracked. The routing order is Groq, GLM, then Amazon Bedrock.
 
 Invoke the local AgentCore contract:
 
@@ -19,6 +21,6 @@ curl -X POST http://localhost:8080/invocations \
 
 ## AgentCore deployment
 
-Install the current AgentCore CLI, configure AWS credentials, and create a Python/Strands/Bedrock CodeZip project. Replace the generated `main.py` and package files with this directory, then run `agentcore deploy`. The runtime role needs Bedrock model-invocation and CloudWatch logging permissions.
+The prepared CodeZip project is in `../FoodBridgeAgentCore`. Its runtime role needs Bedrock model-invocation and CloudWatch logging permissions. Store external model credentials in AgentCore Identity under `foodbridge-groq` and `foodbridge-glm`; never place them in committed environment or JSON files.
 
 See the root README for the complete deployment checklist and architecture.
